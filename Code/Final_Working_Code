@@ -1,0 +1,197 @@
+#include <stdint.h>
+#include <stdbool.h>
+#include "driverlib/sysctl.h"
+#include "driverlib/gpio.h"
+#include "inc/hw_gpio.h"
+#include "inc/hw_memmap.h"   // for GPIO Port Base
+#include "inc/hw_types.h"    // needed for HWREG for locking HW
+#include "inc/hw_ints.h"
+#include "driverlib/timer.h"
+#include "driverlib/pin_map.h"
+#include "driverlib/interrupt.h"
+#include "driverlib/pwm.h"
+
+#define MOTOR_DIRECTION_IO    GPIO_PIN_1  //PD1
+#define Servo_DIRECTION_IO    GPIO_PIN_0  //PD0
+
+#define TRUE  1
+#define FALSE 0
+#define LED_OFF               FALSE
+
+// Buttons HW Position
+#define LEFT_BUTTON        GPIO_PIN_0 // PF0
+#define RIGHT_BUTTON       GPIO_PIN_4 // PF4
+
+#define BUTTON_OFF         FALSE
+
+// Button states:
+uint8_t ButtonState_L  = BUTTON_OFF;
+uint8_t ButtonState_R  = BUTTON_OFF;
+uint8_t ButtonState_RL = BUTTON_OFF;
+uint8_t ButtonState_NP = BUTTON_OFF;
+
+uint8_t ButtonStates   = BUTTON_OFF;
+
+uint32_t MaxDelay = 0;
+
+void delay_1ms (uint32_t delay);
+uint8_t Count = 0;
+volatile uint32_t pulseWidth = 0;
+volatile float frequency = 0.0f;
+#define TIMER_CLOCK_FREQ 50000000 // 50 MHz
+#define DELAY_1ms  1000000/(625) // approximately 1ms delay at ~16 MHz clock
+
+void Timer0AIntHandler(void) {
+    static uint32_t startTime = 0, endTime = 0;
+    static bool firstEdge = true;
+
+    // Clear the interrupt
+    TimerIntClear(TIMER0_BASE, TIMER_CAPA_EVENT);
+
+    if (firstEdge) {
+        // Capture rising edge time
+        startTime = TimerValueGet(TIMER0_BASE, TIMER_A);
+        firstEdge = false;
+        TimerControlEvent(TIMER0_BASE, TIMER_A, TIMER_EVENT_NEG_EDGE); // Switch to falling edge
+    } else {
+        // Capture falling edge time
+        endTime = TimerValueGet(TIMER0_BASE, TIMER_A);
+        pulseWidth = (startTime > endTime)
+                     ? (0xFFFF - startTime + endTime)
+                     : (endTime - startTime); // Handle timer wraparound
+
+        firstEdge = true;
+        MaxDelay = 500;
+        TimerControlEvent(TIMER0_BASE, TIMER_A, TIMER_EVENT_POS_EDGE); // Switch back to rising edge
+    }
+}
+
+void setupTimerAndPin(void) {
+    // Set the system clock to 50 MHz
+    SysCtlClockSet(SYSCTL_SYSDIV_6 | SYSCTL_USE_PLL | SYSCTL_OSC_MAIN | SYSCTL_XTAL_16MHZ);
+
+    // Enable peripherals for GPIO Port F and Timer0
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOF);
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_TIMER0);
+
+    // Wait for peripherals to be ready
+    while (!SysCtlPeripheralReady(SYSCTL_PERIPH_GPIOF));
+    while (!SysCtlPeripheralReady(SYSCTL_PERIPH_TIMER0));
+
+    // Configure PF0 as T0CCP0
+    GPIOPinConfigure(GPIO_PF0_T0CCP0);
+    GPIOPinTypeTimer(GPIO_PORTF_BASE, GPIO_PIN_0);
+
+    // Unlock PF0 (if locked due to NMI function)
+    HWREG(GPIO_PORTF_BASE + GPIO_O_LOCK) = GPIO_LOCK_KEY;
+    HWREG(GPIO_PORTF_BASE + GPIO_O_CR) |= GPIO_PIN_0;
+    HWREG(GPIO_PORTF_BASE + GPIO_O_LOCK) = 0;
+
+    // Configure Timer0A for edge time capture mode
+    TimerConfigure(TIMER0_BASE, TIMER_CFG_SPLIT_PAIR | TIMER_CFG_A_CAP_TIME);
+    TimerControlEvent(TIMER0_BASE, TIMER_A, TIMER_EVENT_POS_EDGE); // Start with rising edge
+
+    // Register the interrupt handler for Timer0A
+    TimerIntRegister(TIMER0_BASE, TIMER_A, Timer0AIntHandler);
+
+    // Enable Timer0A and its interrupt
+    TimerIntEnable(TIMER0_BASE, TIMER_CAPA_EVENT);
+    TimerEnable(TIMER0_BASE, TIMER_A);
+
+    // Enable Timer0A interrupt in the NVIC
+    IntEnable(INT_TIMER0A);
+    IntMasterEnable();
+}
+
+
+int main(void) {
+
+
+    uint32_t MotorDuty = 1;
+    uint32_t ServoDuty = 1;
+
+    // Set the clock frequency
+    SysCtlClockSet(SYSCTL_OSC_MAIN|SYSCTL_USE_PLL|SYSCTL_XTAL_16MHZ|SYSCTL_SYSDIV_6);
+
+    // Enable peripherals for GPIO Port F and PD
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOF);
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOD);
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_PWM1);
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_PWM0);
+
+    // Configure GPIO pins for PWM output
+    GPIOPinTypePWM(GPIO_PORTD_BASE, MOTOR_DIRECTION_IO);
+    GPIOPinTypePWM(GPIO_PORTD_BASE, Servo_DIRECTION_IO);
+
+    // Configure PWM Generators
+    GPIOPinConfigure(GPIO_PD1_M1PWM1);
+    GPIOPinConfigure(GPIO_PD0_M0PWM6);
+
+    PWMGenConfigure(PWM1_BASE,PWM_GEN_0,PWM_GEN_MODE_DOWN);
+    PWMGenConfigure(PWM0_BASE,PWM_GEN_3,PWM_GEN_MODE_DOWN);
+
+    // Set PWM clock divider
+    SysCtlPWMClockSet(SYSCTL_PWMDIV_16);
+
+    // Set PWM period
+    PWMGenPeriodSet(PWM1_BASE, PWM_GEN_0,41667);
+    PWMGenPeriodSet(PWM0_BASE, PWM_GEN_3, 41667);
+
+    // Set the pulse width (this will require you setup variables)
+    PWMPulseWidthSet(PWM1_BASE, PWM_OUT_1, MotorDuty);
+    PWMPulseWidthSet(PWM0_BASE, PWM_OUT_6, ServoDuty);
+
+    // Enable Pins to Turn On
+    PWMOutputState(PWM1_BASE, PWM_OUT_1_BIT, true);
+    PWMOutputState(PWM0_BASE, PWM_OUT_6_BIT, true);
+
+    // Enable PWM generators
+    PWMGenEnable(PWM1_BASE, PWM_GEN_0);
+    PWMGenEnable(PWM0_BASE, PWM_GEN_3);
+
+    // Set button GPIO pins as input with pull-up
+    GPIODirModeSet(GPIO_PORTF_BASE, (LEFT_BUTTON | RIGHT_BUTTON), GPIO_DIR_MODE_IN);
+    GPIOPadConfigSet(GPIO_PORTF_BASE, (LEFT_BUTTON | RIGHT_BUTTON), GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPU);
+
+    setupTimerAndPin();
+
+    while (1) {
+        if (pulseWidth > 0) {
+            frequency = (float)TIMER_CLOCK_FREQ / pulseWidth;
+            MaxDelay = 500;
+        }
+
+        // Check if frequency is in the desired range and adjust ServoDuty accordingly
+        if (frequency >= 802 && frequency <= 809) {
+            ServoDuty = 5000;
+            MaxDelay = 500;
+        }
+
+        else if (frequency >= 810 && frequency < 823) {
+            ServoDuty = 2083;
+            MaxDelay = 500;
+        }
+
+        else {
+            ServoDuty = 3945;
+            MaxDelay = 500;
+        }
+
+        // Update PWM pulse width for servo motor
+        PWMPulseWidthSet(PWM0_BASE, PWM_OUT_6, ServoDuty);
+
+        delay_1ms(MaxDelay);
+    }
+}
+
+// Delay function
+void delay_1ms (uint32_t delay) {
+    uint32_t loopDelay=0;
+    while(delay) {
+        while(loopDelay < DELAY_1ms) {
+            loopDelay++; // spinloop wait delay (do nothing for 1ms)
+        }
+        loopDelay = 0;
+        delay--;
+    }
+}
